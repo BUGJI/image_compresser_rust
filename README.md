@@ -19,6 +19,7 @@
 - 并发 worker（默认按 CPU 核数）；进度按批输出，可安全中断续跑（默认跳过已存在产物，`--overwrite` 覆盖）
 - 输入输出为同一目录时报错；输出目录位于输入目录内部时自动排除，避免递归重复转码
 - 损坏/不支持文件不会中断整体，汇总统计并计入退出码
+- 支持 `--output-format json` 输出 NDJSON（每行一个事件），便于脚本/上游程序消费
 
 ## 编译与运行
 
@@ -55,6 +56,9 @@ image_compresser -i ./pics -o ./pics_webp --overwrite --batch 0 -v
 
 # 只看会转哪些，不写盘
 image_compresser -i ./pics -o ./pics_webp --dry-run
+
+# 机器可读：stdout 只输出 NDJSON 事件
+image_compresser -i ./pics -o ./pics_webp --output-format json
 ```
 
 ## 全部参数
@@ -67,10 +71,11 @@ image_compresser -i ./pics -o ./pics_webp --dry-run
 | `--width <px>` | 缩放宽度阈值 | `512` | 仅在 `--resize` 时生效 |
 | `-q, --quality <1-100>` | WebP 编码质量 | `80` | 越低体积越小、画质越差 |
 | `-j, --workers <N>` | 并发 worker 数 | `0`=自动 | `0` 按 CPU 核数；超大图多、内存紧张时建议调小（如 `4`） |
-| `--batch <N>` | 进度日志分批条数 | `100` | 每处理 N 条打印一次 `[进度]`；`0`=关闭进度输出 |
+| `--batch <N>` | 进度日志分批条数(仅 text) | `100` | 每处理 N 条打印一次 `[进度]`；`0`=关闭 |
 | `--overwrite` | 覆盖已存在的目标文件 | 关闭 | 默认跳过已存在产物（幂等、可中断续跑） |
 | `--dry-run` | 只打印待转换清单 | 关闭 | 不创建目录、不写文件 |
-| `-v, --verbose` | 每步详细信息 | 关闭 | 打印每次转换/跳过的原因，输出到 stderr |
+| `--output-format <text\|json>` | 输出格式 | `text` | `text`=人类可读；`json`=每行一个 JSON 事件（NDJSON，见下节） |
+| `-v, --verbose` | 每步详细信息 | 关闭 | 仅 `text` 模式生效；打印到 stderr |
 | `-h, --help` | 帮助 | — | |
 | `-V, --version` | 版本号 | — | |
 
@@ -112,13 +117,55 @@ pnm, pbm, pgm, ppm, pam, qoi, hdr, dds, webp
 | `--overwrite`/默认跳过 | 输出已存在策略（幂等续跑） |
 | `--resize` | 缩放开关（仅超阈值才缩小） |
 
+## JSON 输出（NDJSON，`--output-format json`）
+
+该模式下 **stdout 只输出 NDJSON**（每行一个事件），便于管道/脚本逐行消费；人类可读的汇总、进度、`-v` 明细均不进入 stdout。`rel` 用 `/` 分隔、含 JSON 转义；`ok:true` 行的 `width/height` 为**产物(缩放后)**尺寸。
+
+事件覆盖**每个扫描到的文件**，因此可严格对账：`success + skipped + failed == scan.total`。
+
+### 事件
+
+扫描结束（开始干活前）：
+
+```json
+{"event":"scan","total":9888}
+```
+
+每处理一个文件（成功带产物宽高；跳过/失败用 `reason`）：
+
+```json
+{"event":"file","ok":true,"rel":"sub/a.png","width":3648,"height":5472}
+{"event":"file","ok":false,"rel":"sub/a.png","reason":"decode"}
+{"event":"file","ok":false,"rel":"readme.txt","reason":"unsupported"}
+{"event":"file","ok":false,"rel":"sub/a.png","reason":"exists"}
+```
+
+结束汇总：
+
+```json
+{"event":"done","success":9800,"skipped":50,"failed":38}
+```
+
+### `reason` 取值
+
+| 值 | 含义 | 计入 |
+|---|---|---|
+| `read` | 源文件读取失败 | failed |
+| `decode` | 解码失败（含损坏/无法解析） | failed |
+| `encode` | WebP 编码失败 | failed |
+| `write` | 写入输出失败 | failed |
+| `exists` | 输出已存在且未开 `--overwrite` | skipped |
+| `unsupported` | 扩展名不在白名单，不转换 | skipped |
+
+`--dry-run` + `--output-format json`：同样输出 `scan`/逐文件/`done`，可转换的文件为 `ok:true`（不写盘、无 `width/height`），用于预览。
+
 ## 测试
 
 ```bash
 cargo test
 ```
 
-覆盖：目录镜像结构与产物命名、重跑跳过/`--overwrite`、GIF 首帧尺寸、`--resize` 缩放与不缩放路径、损坏文件退出码、`--dry-run` 不写盘、输出目录嵌套时防递归、扩展名与内容不符回退识别。
+覆盖：目录镜像结构与产物命名、重跑跳过/`--overwrite`、GIF 首帧尺寸、`--resize` 缩放与不缩放路径、损坏文件退出码、`--dry-run` 不写盘、输出目录嵌套时防递归、扩展名与内容不符回退识别、JSON 输出（NDJSON 对账/坏文件 reason 与退出码/JSON dry-run）。
 
 ## 注意事项
 

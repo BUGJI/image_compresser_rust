@@ -257,3 +257,140 @@ fn mislabeled_extension_decoded_by_content() {
     let data = fs::read(p).unwrap();
     assert_eq!(webp_dims(&data), (12, 9));
 }
+
+#[test]
+fn json_output_ndjson_and_reconcilable() {
+    let tmp = TempDir::new().unwrap();
+    let inp = build_tree(tmp.path());
+    let out = tmp.path().join("out");
+    let o = run(&[
+        "-i",
+        inp.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--output-format",
+        "json",
+    ]);
+    assert!(o.status.success());
+
+    let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        !stdout.contains('\\'),
+        "stdout must be pure ndjson, got: {stdout}"
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some(r#"{"event":"scan","total":5}"#)
+    );
+
+    let file_lines: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.contains("\"event\":\"file\""))
+        .copied()
+        .collect();
+    assert_eq!(
+        file_lines.len(),
+        5,
+        "every scanned file must emit one event"
+    );
+    assert!(
+        stdout.contains("\"rel\":\"sub/deep/c.gif\""),
+        "rel must use forward slashes"
+    );
+    assert!(stdout.contains("\"rel\":\"note/readme.txt\""));
+
+    let ok_true = file_lines
+        .iter()
+        .filter(|l| l.contains("\"ok\":true"))
+        .count();
+    assert_eq!(ok_true, 4);
+    assert!(
+        stdout.contains("\"width\":10,\"height\":10"),
+        "ok event must carry output dims"
+    );
+    let unsupported = file_lines
+        .iter()
+        .filter(|l| l.contains("\"reason\":\"unsupported\""))
+        .count();
+    assert_eq!(unsupported, 1);
+    assert_eq!(
+        lines.last().copied(),
+        Some(r#"{"event":"done","success":4,"skipped":1,"failed":0}"#)
+    );
+
+    let o2 = run(&[
+        "-i",
+        inp.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--output-format",
+        "json",
+    ]);
+    assert!(o2.status.success());
+    let s2 = String::from_utf8_lossy(&o2.stdout).into_owned();
+    assert_eq!(
+        s2.matches("\"reason\":\"exists\"").count(),
+        4,
+        "rerun marks 4 exists"
+    );
+    assert!(
+        s2.trim_end()
+            .ends_with(r#"{"event":"done","success":0,"skipped":5,"failed":0}"#),
+        "{s2}"
+    );
+}
+
+#[test]
+fn json_output_corrupt_reports_decode_and_exit_code() {
+    let tmp = TempDir::new().unwrap();
+    let inp = tmp.path().join("in");
+    fs::create_dir_all(&inp).unwrap();
+    fs::write(inp.join("bad.png"), b"not a real image").unwrap();
+    png(&inp.join("good.png"), 6, 4, [9, 9, 9, 255]);
+    let out = tmp.path().join("out");
+    let o = run(&[
+        "-i",
+        inp.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--output-format",
+        "json",
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        stdout.contains(r#"{"event":"file","ok":false,"rel":"bad.png","reason":"decode"}"#),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .trim_end()
+            .ends_with(r#"{"event":"done","success":1,"skipped":0,"failed":1}"#)
+    );
+}
+
+#[test]
+fn json_output_dry_run() {
+    let tmp = TempDir::new().unwrap();
+    let inp = build_tree(tmp.path());
+    let out = tmp.path().join("out");
+    let o = run(&[
+        "-i",
+        inp.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--output-format",
+        "json",
+        "--dry-run",
+    ]);
+    assert!(o.status.success());
+    assert!(!out.exists());
+    let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(stdout.contains("\"ok\":true") && stdout.contains("\"reason\":\"unsupported\""));
+    assert!(
+        stdout
+            .trim_end()
+            .ends_with(r#"{"event":"done","success":4,"skipped":1,"failed":0}"#)
+    );
+}

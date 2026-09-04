@@ -6,10 +6,40 @@ use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
 use webp::Encoder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
+pub enum Status {
     Done,
-    SkippedExists,
+    Exists,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailReason {
+    Read,
+    Decode,
+    Encode,
+    Write,
+}
+
+impl FailReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailReason::Read => "read",
+            FailReason::Decode => "decode",
+            FailReason::Encode => "encode",
+            FailReason::Write => "write",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FileResult {
+    pub status: Status,
+    pub fail_reason: Option<FailReason>,
+    pub err: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub in_bytes: u64,
+    pub out_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -18,6 +48,30 @@ pub struct ConvConfig {
     pub width: u32,
     pub quality: u8,
     pub overwrite: bool,
+}
+
+fn fail(reason: FailReason, err: String) -> FileResult {
+    FileResult {
+        status: Status::Failed,
+        fail_reason: Some(reason),
+        err: Some(err),
+        width: 0,
+        height: 0,
+        in_bytes: 0,
+        out_bytes: 0,
+    }
+}
+
+fn empty(status: Status) -> FileResult {
+    FileResult {
+        status,
+        fail_reason: None,
+        err: None,
+        width: 0,
+        height: 0,
+        in_bytes: 0,
+        out_bytes: 0,
+    }
 }
 
 pub fn image_format_of(ext: &str) -> Option<ImageFormat> {
@@ -38,25 +92,14 @@ pub fn image_format_of(ext: &str) -> Option<ImageFormat> {
     }
 }
 
-pub fn convert_one(
-    src: &Path,
-    out: &Path,
-    cfg: &ConvConfig,
-    verbose: bool,
-) -> (Outcome, Option<(u64, u64)>) {
+pub fn convert_one(src: &Path, out: &Path, cfg: &ConvConfig) -> FileResult {
     if !cfg.overwrite && out.exists() {
-        if verbose {
-            eprintln!("[跳过] 输出已存在: {}", out.display());
-        }
-        return (Outcome::SkippedExists, None);
+        return empty(Status::Exists);
     }
 
     let in_size = match fs::metadata(src) {
         Ok(m) => m.len(),
-        Err(e) => {
-            eprintln!("[失败] {}: {}", src.display(), e);
-            return (Outcome::Failed, None);
-        }
+        Err(e) => return fail(FailReason::Read, format!("读取文件失败: {e}")),
     };
 
     let ext = src
@@ -66,50 +109,38 @@ pub fn convert_one(
         .to_ascii_lowercase();
     let fmt = match image_format_of(&ext) {
         Some(f) => f,
-        None => {
-            eprintln!("[失败] {}: 不支持的扩展名", src.display());
-            return (Outcome::Failed, None);
-        }
+        None => return fail(FailReason::Decode, "不支持的扩展名".into()),
     };
 
     let img = match decode(src, fmt) {
         Ok(img) => img,
-        Err(e) => {
-            eprintln!("[失败] {}: 解码错误: {}", src.display(), e);
-            return (Outcome::Failed, None);
-        }
+        Err(e) => return fail(FailReason::Decode, format!("解码错误: {e}")),
     };
 
     let img = apply_resize(img, cfg);
 
     let out_bytes = match encode_webp(&img, cfg.quality) {
         Some(b) => b,
-        None => {
-            eprintln!("[失败] {}: WebP 编码失败", src.display());
-            return (Outcome::Failed, None);
-        }
+        None => return fail(FailReason::Encode, "WebP 编码失败".into()),
     };
 
     if let Err(e) = write_file(out, &out_bytes, cfg.overwrite) {
-        eprintln!(
-            "[失败] {}: 写入 {} 失败: {}",
-            src.display(),
-            out.display(),
-            e
+        return fail(
+            FailReason::Write,
+            format!("写入 {} 失败: {}", out.display(), e),
         );
-        return (Outcome::Failed, None);
     }
 
-    if verbose {
-        eprintln!(
-            "[转换] {} -> {} ({}B -> {}B)",
-            src.display(),
-            out.display(),
-            in_size,
-            out_bytes.len()
-        );
+    let (width, height) = img.dimensions();
+    FileResult {
+        status: Status::Done,
+        fail_reason: None,
+        err: None,
+        width,
+        height,
+        in_bytes: in_size,
+        out_bytes: out_bytes.len() as u64,
     }
-    (Outcome::Done, Some((in_size, out_bytes.len() as u64)))
 }
 
 fn decode(src: &Path, fmt: ImageFormat) -> image::ImageResult<DynamicImage> {

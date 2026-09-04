@@ -13,10 +13,18 @@ pub struct ScanCounts {
     pub walk_errors: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Image,
+    Unsupported,
+}
+
 #[derive(Debug, Clone)]
-pub struct Job {
+pub struct Entry {
+    pub kind: Kind,
     pub src: PathBuf,
-    pub out: PathBuf,
+    pub rel: PathBuf,
+    pub out: Option<PathBuf>,
 }
 
 pub fn out_path_for(output_root: &Path, rel: &Path) -> PathBuf {
@@ -30,9 +38,9 @@ pub fn scan(
     output_root: &Path,
     exclude: Option<&Path>,
     verbose: bool,
-) -> (Vec<Job>, ScanCounts) {
+) -> (Vec<Entry>, ScanCounts) {
     let mut counts = ScanCounts::default();
-    let mut jobs = Vec::new();
+    let mut entries = Vec::new();
 
     let iter = WalkDir::new(input)
         .min_depth(1)
@@ -66,17 +74,25 @@ pub fn scan(
             if verbose {
                 eprintln!("[忽略] 非支持的图片扩展名: {}", path.display());
             }
+            entries.push(Entry {
+                kind: Kind::Unsupported,
+                src: path.to_path_buf(),
+                rel: rel.to_path_buf(),
+                out: None,
+            });
             continue;
         }
 
         counts.supported += 1;
-        jobs.push(Job {
+        entries.push(Entry {
+            kind: Kind::Image,
             src: path.to_path_buf(),
-            out: out_path_for(output_root, rel),
+            rel: rel.to_path_buf(),
+            out: Some(out_path_for(output_root, rel)),
         });
     }
 
-    (jobs, counts)
+    (entries, counts)
 }
 
 pub fn supported_ext_list() -> String {

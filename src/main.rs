@@ -1,18 +1,18 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 
 mod convert;
 mod scan;
 
-use convert::{ConvConfig, Outcome};
-use scan::{Job, ScanCounts};
+use convert::{ConvConfig, FailReason, Status};
+use scan::{Entry, Kind, ScanCounts};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,7 +45,11 @@ struct Cli {
     )]
     workers: usize,
 
-    #[arg(long, default_value_t = 100, help = "进度日志分批条数，0=关闭进度输出")]
+    #[arg(
+        long,
+        default_value_t = 100,
+        help = "进度日志分批条数(仅 text 模式)，0=关闭进度输出"
+    )]
     batch: u64,
 
     #[arg(long, help = "输出文件已存在时覆盖；默认跳过")]
@@ -54,8 +58,22 @@ struct Cli {
     #[arg(long, help = "仅扫描并打印将要转换的文件，不写入")]
     dry_run: bool,
 
-    #[arg(short, long, help = "输出每步详细信息")]
+    #[arg(short, long, help = "输出每步详细信息(仅 text 模式)")]
     verbose: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value = "text",
+        help = "输出格式：text=人类可读；json=每行一个 JSON 事件(NDJSON)"
+    )]
+    output_format: OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
 }
 
 struct Summary {
@@ -66,6 +84,21 @@ struct Summary {
     in_bytes: u64,
     out_bytes: u64,
     elapsed_ms: u128,
+}
+
+enum Task {
+    Done {
+        width: u32,
+        height: u32,
+        in_bytes: u64,
+        out_bytes: u64,
+    },
+    Exists,
+    Unsupported,
+    Failed {
+        reason: FailReason,
+        err: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -93,7 +126,7 @@ fn run(cli: &Cli) -> Result<u8, String> {
     }
     let exclude = out_canon.as_deref().filter(|c| c.starts_with(&input));
 
-    let (jobs, scan_counts) = scan::scan(&input, &output_root, exclude, cli.verbose);
+    let (entries, scan_counts) = scan::scan(&input, &output_root, exclude, cli.verbose);
 
     let workers = if cli.workers > 0 {
         cli.workers
@@ -102,44 +135,57 @@ fn run(cli: &Cli) -> Result<u8, String> {
             .map(|n| n.get())
             .unwrap_or(1)
     };
+    let json = cli.output_format == OutputFormat::Json;
 
-    println!("输入目录: {}", input.display());
-    println!("输出目录: {}", output_root.display());
-    println!(
-        "设置: 质量={} | resize={}(阈值{}px) | workers={} | 进度批次={} | overwrite={}",
-        cli.quality, cli.resize, cli.width, workers, cli.batch, cli.overwrite
-    );
-    println!(
-        "扫描: 共 {} 个文件, 支持格式 {} 个(扩展名: {}), 跳过(非图片扩展) {} 个",
-        scan_counts.total_files,
-        scan_counts.supported,
-        scan::supported_ext_list(),
-        scan_counts.skipped_ext
-    );
     if scan_counts.walk_errors > 0 {
         eprintln!("警告: 目录遍历失败 {} 处", scan_counts.walk_errors);
     }
 
+    let cfg = ConvConfig {
+        resize: cli.resize,
+        width: cli.width,
+        quality: cli.quality,
+        overwrite: cli.overwrite,
+    };
+    let image_count = entries.iter().filter(|e| e.kind == Kind::Image).count();
+
     if cli.dry_run {
-        if jobs.is_empty() {
-            println!("没有可转换的文件");
-        }
-        for job in &jobs {
-            if !cli.overwrite && job.out.exists() {
-                println!(
-                    "[将跳过-已存在] {}  =>  {}",
-                    job.src.display(),
-                    job.out.display()
-                );
-            } else {
-                println!("{}  =>  {}", job.src.display(), job.out.display());
-            }
+        if json {
+            emit_scan(scan_counts.total_files);
+            dry_run_json(&entries, cli.overwrite);
+        } else {
+            dry_run_text(&entries, cli.overwrite);
         }
         return Ok(0);
     }
 
-    if jobs.is_empty() {
-        println!("没有可转换的文件");
+    if !json {
+        println!("输入目录: {}", input.display());
+        println!("输出目录: {}", output_root.display());
+        println!(
+            "设置: 质量={} | resize={}(阈值{}px) | workers={} | 进度批次={} | overwrite={}",
+            cli.quality, cli.resize, cli.width, workers, cli.batch, cli.overwrite
+        );
+        println!(
+            "扫描: 共 {} 个文件, 支持格式 {} 个(扩展名: {}), 跳过(非图片扩展) {} 个",
+            scan_counts.total_files,
+            scan_counts.supported,
+            scan::supported_ext_list(),
+            scan_counts.skipped_ext
+        );
+    }
+
+    if image_count == 0 {
+        if !json {
+            println!("没有可转换的文件");
+        }
+        if json {
+            emit_scan(scan_counts.total_files);
+            for e in &entries {
+                emit_json_skip(e, "unsupported");
+            }
+            emit_done(0, entries.len() as u64, 0);
+        }
         return Ok(0);
     }
 
@@ -149,64 +195,239 @@ fn run(cli: &Cli) -> Result<u8, String> {
         .map_err(|e| format!("创建 worker 线程池失败: {e}"))?;
 
     let start = Instant::now();
+    if json {
+        emit_scan(scan_counts.total_files);
+    }
     let processed = AtomicU64::new(0);
-    let total = jobs.len() as u64;
-    let cfg = ConvConfig {
-        resize: cli.resize,
-        width: cli.width,
-        quality: cli.quality,
-        overwrite: cli.overwrite,
-    };
+    let total_attempt = image_count as u64;
     let verbose = cli.verbose;
     let batch = cli.batch;
 
-    let results: Vec<(Outcome, Option<(u64, u64)>)> = pool.install(|| {
-        jobs.par_iter()
-            .map(|job: &Job| {
-                let (outcome, sizes) = convert::convert_one(&job.src, &job.out, &cfg, verbose);
-                let cur = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                if batch > 0 && cur.is_multiple_of(batch) {
-                    eprintln!("[进度] 已处理 {cur}/{total}");
+    let results: Vec<Task> = pool.install(|| {
+        entries
+            .par_iter()
+            .map(|e: &Entry| {
+                let task = process_entry(e, &cfg);
+                if json {
+                    emit_json_task(e, &task);
+                } else {
+                    emit_text_task(e, &task, verbose);
+                    if !matches!(task, Task::Unsupported) {
+                        let cur = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                        if batch > 0 && cur.is_multiple_of(batch) {
+                            eprintln!("[进度] 已处理 {cur}/{total_attempt}");
+                        }
+                    }
                 }
-                (outcome, sizes)
+                task
             })
             .collect()
     });
 
     let mut done = 0u64;
     let mut skipped_exists = 0u64;
+    let mut skipped_unsupported = 0u64;
     let mut failed = 0u64;
     let mut in_bytes = 0u64;
     let mut out_bytes = 0u64;
-    for (outcome, sizes) in results {
-        match outcome {
-            Outcome::Done => {
+    for task in results {
+        match task {
+            Task::Done {
+                width: _,
+                height: _,
+                in_bytes: i,
+                out_bytes: o,
+            } => {
                 done += 1;
-                if let Some((i, o)) = sizes {
-                    in_bytes += i;
-                    out_bytes += o;
-                }
+                in_bytes += i;
+                out_bytes += o;
             }
-            Outcome::SkippedExists => skipped_exists += 1,
-            Outcome::Failed => failed += 1,
+            Task::Exists => skipped_exists += 1,
+            Task::Unsupported => skipped_unsupported += 1,
+            Task::Failed { .. } => failed += 1,
         }
     }
 
-    let summary = Summary {
-        scan: scan_counts,
-        done,
-        skipped_exists,
-        failed,
-        in_bytes,
-        out_bytes,
-        elapsed_ms: start.elapsed().as_millis(),
-    };
-    print_summary(&summary);
-
-    if summary.done > 0 {
-        println!("输出目录: {}", output_root.display());
+    if json {
+        emit_done(done, skipped_exists + skipped_unsupported, failed);
+    } else {
+        let summary = Summary {
+            scan: scan_counts,
+            done,
+            skipped_exists,
+            failed,
+            in_bytes,
+            out_bytes,
+            elapsed_ms: start.elapsed().as_millis(),
+        };
+        print_summary(&summary);
+        if done > 0 {
+            println!("输出目录: {}", output_root.display());
+        }
     }
-    Ok(if summary.failed > 0 { 1 } else { 0 })
+
+    Ok(if failed > 0 { 1 } else { 0 })
+}
+
+fn process_entry(e: &Entry, cfg: &ConvConfig) -> Task {
+    match e.kind {
+        Kind::Unsupported => Task::Unsupported,
+        Kind::Image => {
+            let out = e.out.as_ref().expect("image entry has output path");
+            let r = convert::convert_one(&e.src, out, cfg);
+            match r.status {
+                Status::Done => Task::Done {
+                    width: r.width,
+                    height: r.height,
+                    in_bytes: r.in_bytes,
+                    out_bytes: r.out_bytes,
+                },
+                Status::Exists => Task::Exists,
+                Status::Failed => Task::Failed {
+                    reason: r.fail_reason.unwrap_or(FailReason::Decode),
+                    err: r.err.unwrap_or_default(),
+                },
+            }
+        }
+    }
+}
+
+fn dry_run_text(entries: &[Entry], overwrite: bool) {
+    let images: Vec<&Entry> = entries.iter().filter(|e| e.kind == Kind::Image).collect();
+    if images.is_empty() {
+        println!("没有可转换的文件");
+        return;
+    }
+    for e in images {
+        let out = e.out.as_ref().unwrap();
+        if !overwrite && out.exists() {
+            println!("[将跳过-已存在] {}  =>  {}", e.src.display(), out.display());
+        } else {
+            println!("{}  =>  {}", e.src.display(), out.display());
+        }
+    }
+}
+
+fn dry_run_json(entries: &[Entry], overwrite: bool) {
+    let mut success = 0u64;
+    let mut skipped = 0u64;
+    for e in entries {
+        match e.kind {
+            Kind::Unsupported => {
+                emit_json_skip(e, "unsupported");
+                skipped += 1;
+            }
+            Kind::Image => {
+                let out = e.out.as_ref().unwrap();
+                if !overwrite && out.exists() {
+                    emit_json_skip(e, "exists");
+                    skipped += 1;
+                } else {
+                    emit_json_ok_nodims(e);
+                    success += 1;
+                }
+            }
+        }
+    }
+    emit_done(success, skipped, 0);
+}
+
+fn emit_text_task(e: &Entry, task: &Task, verbose: bool) {
+    match task {
+        Task::Done {
+            in_bytes,
+            out_bytes,
+            ..
+        } => {
+            if verbose {
+                let out = e.out.as_ref().unwrap();
+                eprintln!(
+                    "[转换] {} -> {} ({}B -> {}B)",
+                    e.src.display(),
+                    out.display(),
+                    in_bytes,
+                    out_bytes
+                );
+            }
+        }
+        Task::Exists => {
+            if verbose {
+                let out = e.out.as_ref().unwrap();
+                eprintln!("[跳过] 输出已存在: {}", out.display());
+            }
+        }
+        Task::Unsupported => {}
+        Task::Failed { err, .. } => {
+            eprintln!("[失败] {}: {}", e.src.display(), err);
+        }
+    }
+}
+
+fn emit_json_task(e: &Entry, task: &Task) {
+    match task {
+        Task::Done { width, height, .. } => emit_json_ok(&e.rel, *width, *height),
+        Task::Exists => emit_json_skip(e, "exists"),
+        Task::Unsupported => emit_json_skip(e, "unsupported"),
+        Task::Failed { reason, .. } => emit_json_skip(e, reason.as_str()),
+    }
+}
+
+fn emit_scan(total: usize) {
+    println!("{{\"event\":\"scan\",\"total\":{total}}}");
+}
+
+fn emit_json_ok(rel: &Path, width: u32, height: u32) {
+    println!(
+        "{{\"event\":\"file\",\"ok\":true,\"rel\":\"{}\",\"width\":{width},\"height\":{height}}}",
+        json_escape(&rel_slash(rel))
+    );
+}
+
+fn emit_json_ok_nodims(e: &Entry) {
+    println!(
+        "{{\"event\":\"file\",\"ok\":true,\"rel\":\"{}\"}}",
+        json_escape(&rel_slash(&e.rel))
+    );
+}
+
+fn emit_json_skip(e: &Entry, reason: &str) {
+    println!(
+        "{{\"event\":\"file\",\"ok\":false,\"rel\":\"{}\",\"reason\":\"{}\"}}",
+        json_escape(&rel_slash(&e.rel)),
+        reason
+    );
+}
+
+fn emit_done(success: u64, skipped: u64, failed: u64) {
+    println!(
+        "{{\"event\":\"done\",\"success\":{success},\"skipped\":{skipped},\"failed\":{failed}}}"
+    );
+}
+
+fn rel_slash(rel: &Path) -> String {
+    rel.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn print_summary(s: &Summary) {
